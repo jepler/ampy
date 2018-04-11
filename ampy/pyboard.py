@@ -39,6 +39,7 @@ Or:
 
 import sys
 import time
+import binascii
 
 _rawdelay = None
 
@@ -172,45 +173,39 @@ class Pyboard:
                 time.sleep(0.01)
         return data
 
-    def enter_raw_repl(self):
+    def enter_raw_repl(self, ntries=3):
         # Brief delay before sending RAW MODE char if requests
         if _rawdelay > 0:
             time.sleep(_rawdelay)
 
-        self.serial.write(b'\r\x03\x03') # ctrl-C twice: interrupt any running program
+        for i in range(ntries):
+            self.serial.write(b'\r\x03\x03') # ctrl-C twice: interrupt any running program
 
-        # flush input (without relying on serial.flushInput())
-        n = self.serial.inWaiting()
-        while n > 0:
-            self.serial.read(n)
+            # flush input (without relying on serial.flushInput())
             n = self.serial.inWaiting()
+            while n > 0:
+                self.serial.read(n)
+                n = self.serial.inWaiting()
 
-        self.serial.write(b'\r\x01') # ctrl-A: enter raw REPL
-        data = self.read_until(1, b'raw REPL; CTRL-B to exit\r\n>')
-        if not data.endswith(b'raw REPL; CTRL-B to exit\r\n>'):
+            self.serial.write(b'\r\x01') # ctrl-A: enter raw REPL
+            data = self.read_until(1, b'raw REPL; CTRL-B to exit\r\n>')
+            if data.endswith(b'raw REPL; CTRL-B to exit\r\n>'):
+                break
+            time.sleep(.01)
+        else:
             print(data)
             raise PyboardError('could not enter raw repl')
 
-        self.serial.write(b'\x04') # ctrl-D: soft reset
-        data = self.read_until(1, b'soft reboot\r\n')
-        if not data.endswith(b'soft reboot\r\n'):
-            print(data)
-            raise PyboardError('could not enter raw repl')
-        # By splitting this into 2 reads, it allows boot.py to print stuff,
-        # which will show up after the soft reboot and before the raw REPL.
-        # Modification from original pyboard.py below:
-        #   Add a small delay and send Ctrl-C twice after soft reboot to ensure
-        #   any main program loop in main.py is interrupted.
-        time.sleep(0.5)
-        self.serial.write(b'\x03\x03')
-        # End modification above.
-        data = self.read_until(1, b'raw REPL; CTRL-B to exit\r\n')
-        if not data.endswith(b'raw REPL; CTRL-B to exit\r\n'):
-            print(data)
-            raise PyboardError('could not enter raw repl')
-
+        import pkg_resources
+        stub = pkg_resources.resource_string(__package__, 'rstub.py')
+        for chunk in range(0, len(stub), 64):
+            self.serial.write(stub[chunk:chunk+64])
+        self.serial.write("PyboardStub().exec1()")
+        self.serial.write("\4")
+        self.read_until(1, b'OK')
+        
     def exit_raw_repl(self):
-        self.serial.write(b'\r\x02') # ctrl-B: enter friendly REPL
+        self.serial.write(b'\x03\r\x02') # ctrl-B: enter friendly REPL
 
     def follow(self, timeout, data_consumer=None):
         # wait for normal output
@@ -228,36 +223,48 @@ class Pyboard:
         # return normal and error output
         return data, data_err
 
+    def putb64(self, s):
+        self.serial.write(b"\n__STUB__\n")
+        mv = memoryview(s)
+        for i in range(0, len(s), 54):
+            v = mv[i:i+54]
+            self.serial.write(binascii.b2a_base64(v))
+        self.serial.write(b"~~STUB~~\n")
+        
+    def getb64g(self):
+        while 1:
+            line = self.serial.readline().strip()
+            if line.endswith('__STUB__'):
+                if len(line) > 8:
+                    print(line[:-8].decode('ascii', 'replace'))
+                break
+            print(line.decode('ascii', 'replace'))
+        while 1:
+            line = self.serial.readline().strip()
+            if line == '~~STUB~~':
+                break
+            yield binascii.a2b_base64(line)
+        
+    def getb64(self):
+        return b"".join(self.getb64g())
+
+    def stub_command(self, command, *args):
+        self.putb64(command)
+        self.putb64(repr(args).encode('utf-8'))
+        result = self.getb64()
+        result = eval(result)
+        if result[0]: return result[1]
+        else: raise PyboardError(result[1])
+
     def exec_raw_no_follow(self, command):
-        if isinstance(command, bytes):
-            command_bytes = command
-        else:
-            command_bytes = bytes(command, encoding='utf8')
-
-        # check we have a prompt
-        data = self.read_until(1, b'>')
-        if not data.endswith(b'>'):
-            raise PyboardError('could not enter raw repl')
-
-        # write command
-        for i in range(0, len(command_bytes), 256):
-            self.serial.write(command_bytes[i:min(i + 256, len(command_bytes))])
-            time.sleep(0.01)
-        self.serial.write(b'\x04')
-
-        # check if we could exec command
-        data = self.serial.read(2)
-        if data != b'OK':
-            raise PyboardError('could not exec command')
+        self.stub_command(b'exec', command)
 
     def exec_raw(self, command, timeout=10, data_consumer=None):
-        self.exec_raw_no_follow(command);
+        self.exec_raw_no_follow(command)
         return self.follow(timeout, data_consumer)
 
     def eval(self, expression):
-        ret = self.exec_('print({})'.format(expression))
-        ret = ret.strip()
-        return ret
+        return self.stub_command(b'eval', expression)
 
     def exec_(self, command):
         ret, ret_err = self.exec_raw(command)

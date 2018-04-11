@@ -56,27 +56,23 @@ class Files(object):
         # raw bytes.  Be careful not to overload the UART buffer so only write
         # a few bytes at a time, and don't use print since it adds newlines and
         # expects string data.
-        command = """
-            import sys
-            with open('{0}', 'rb') as infile:
-                while True:
-                    result = infile.read({1})
-                    if result == b'':
-                        break
-                    len = sys.stdout.write(result)
-        """.format(filename, BUFFER_SIZE)
         self._pyboard.enter_raw_repl()
         try:
-            out = self._pyboard.exec_(textwrap.dedent(command))
+            self._pyboard.stub_command('open', filename, 'rb')
         except PyboardError as ex:
-            # Check if this is an OSError #2, i.e. file doesn't exist and
-            # rethrow it as something more descriptive.
-            if ex.args[2].decode('utf-8').find('OSError: [Errno 2] ENOENT') != -1:
+            if 'ENOENT' in ex.message:
                 raise RuntimeError('No such file: {0}'.format(filename))
             else:
                 raise ex
+        result = []
+        offset = 0
+        blocksize = 512
+        while 1:
+            block = self._pyboard.stub_command('read', blocksize)
+            if not block: break
+            result.append(block)
         self._pyboard.exit_raw_repl()
-        return out
+        return b''.join(result)
 
     def ls(self, directory='/', long_format=True):
         """List the contents of the specified directory (or root if none is
@@ -90,41 +86,19 @@ class Files(object):
         if not directory.endswith('/'):
             directory += '/'
         # Execute os.listdir() command on the board.
-        if long_format:
-            command = """
-                try:
-                    import os
-                except ImportError:
-                    import uos as os
-                d = '{0}'
-                r = []
-                for f in os.listdir(d):
-                    fp = d + f
-                    _, _, _, _, _, _, size, _, _, _ = os.stat(fp)
-                    r.append('{{0}} - {{1}} bytes'.format(f, size))
-                print(r)
-            """.format(directory)
-        else:
-            command = """
-                try:
-                    import os
-                except ImportError:
-                    import uos as os
-                print(os.listdir('{0}'))
-            """.format(directory)
         self._pyboard.enter_raw_repl()
         try:
-            out = self._pyboard.exec_(textwrap.dedent(command))
+            if long_format:
+                filelist = self._pyboard.stub_command('listdir_long', directory)
+            else:
+                filelist = self._pyboard.stub_command('listdir', directory)
         except PyboardError as ex:
-            # Check if this is an OSError #2, i.e. directory doesn't exist and
-            # rethrow it as something more descriptive.
-            if ex.args[2].decode('utf-8').find('OSError: [Errno 2] ENOENT') != -1:
+            if 'ENOENT' in ex.message:
                 raise RuntimeError('No such directory: {0}'.format(directory))
             else:
                 raise ex
         self._pyboard.exit_raw_repl()
-        # Parse the result list and return it.
-        return ast.literal_eval(out.decode('utf-8'))
+        return filelist
 
     def mkdir(self, directory, exists_okay=False):
         """Create the specified directory.  Note this cannot create a recursive
