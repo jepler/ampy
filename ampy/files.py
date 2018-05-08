@@ -61,7 +61,7 @@ class Files(object):
             with open('{0}', 'rb') as infile:
                 while True:
                     result = infile.read({1})
-                    if result == b'':
+                    if not result:
                         break
                     len = sys.stdout.write(result)
         """.format(filename, BUFFER_SIZE)
